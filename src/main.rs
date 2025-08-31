@@ -13,6 +13,7 @@ use winapi::um::winuser::{
     DispatchMessageW, GetMessageW, MOD_ALT, MOD_CONTROL, MSG, PostQuitMessage, RegisterHotKey,
     TranslateMessage, UnregisterHotKey, WM_HOTKEY, WM_QUIT,
 };
+use webp::{Encoder, WebPMemory}; // 添加WebP支持
 
 // 自定义事件枚举
 #[derive(Debug, Clone)]
@@ -294,7 +295,7 @@ fn handle_event(
         }
         (AppEvent::KeyPressed(Key::S), State::RegionSelected(img, region)) => {
             // 保存选择的区域
-            save_image(
+            save_image_webp(
                 &img,
                 region.0,
                 region.1,
@@ -465,8 +466,56 @@ fn display_image(
         .unwrap();
 }
 
-// 保存图像函数
-fn save_image(
+// 保存为WebP格式的函数（无损）
+fn save_image_webp(
+    image: &ImageBuffer<Rgba<u8>, Vec<u8>>,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    screen_width: u32,
+    screen_height: u32,
+    sub_region: Option<(i32, i32, u32, u32)>,
+) {
+    // 创建目录
+    let dir_name = format!("W{}H{}", screen_width, screen_height);
+    let _ = std::fs::create_dir_all(&dir_name);
+
+    // 生成文件名
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+
+    let mut file_name = format!(
+        "{}/screenshot_{}_Lx{}Ty{}W{}H{}",
+        dir_name, timestamp, x, y, width, height
+    );
+
+    if let Some((sx, sy, sw, sh)) = sub_region {
+        file_name.push_str(&format!("_Sx{}Sy{}Sw{}Sh{}", sx, sy, sw, sh));
+    }
+
+    file_name.push_str(".webp");
+
+    // 裁剪图像
+    let cropped = image::imageops::crop_imm(image, x as u32, y as u32, width, height).to_image();
+
+    // 转换为WebP格式（无损）
+    let encoder = Encoder::from_rgba(cropped.as_raw(), width, height);
+    let webp_data: WebPMemory = encoder.encode_lossless();
+
+    // 保存图像
+    if let Err(e) = std::fs::write(&file_name, webp_data.as_ref()) {
+        eprintln!("Failed to save image: {}", e);
+    } else {
+        println!("Image saved as: {}", file_name);
+    }
+}
+
+// 保留原有的BMP保存函数，但不再使用
+#[allow(dead_code)]
+fn save_image_bmp(
     image: &ImageBuffer<Rgba<u8>, Vec<u8>>,
     x: i32,
     y: i32,
