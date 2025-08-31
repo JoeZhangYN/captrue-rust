@@ -9,11 +9,11 @@ use std::{
     collections::VecDeque,
     time::{SystemTime, UNIX_EPOCH},
 };
+use webp::{Encoder, WebPMemory};
 use winapi::um::winuser::{
     DispatchMessageW, GetMessageW, MOD_ALT, MOD_CONTROL, MSG, PostQuitMessage, RegisterHotKey,
     TranslateMessage, UnregisterHotKey, WM_HOTKEY, WM_QUIT,
 };
-use webp::{Encoder, WebPMemory}; // 添加WebP支持
 
 // 自定义事件枚举
 #[derive(Debug, Clone)]
@@ -24,8 +24,8 @@ enum AppEvent {
     MouseReleased(MouseButton, f32, f32),
     MouseMoved(f32, f32),
     WindowResized(usize, usize),
-    GlobalHotkeyPressed, // 新增：全局热键事件
-    Quit,                // 退出事件
+    GlobalHotkeyPressed,
+    Quit,
 }
 
 // 程序状态
@@ -34,11 +34,22 @@ enum State {
     FullscreenCapture(ImageBuffer<Rgba<u8>, Vec<u8>>),
     SelectingRegion(ImageBuffer<Rgba<u8>, Vec<u8>>, (i32, i32), (i32, i32)),
     RegionSelected(ImageBuffer<Rgba<u8>, Vec<u8>>, (i32, i32, i32, i32)),
+    SelectingSubRegion(
+        ImageBuffer<Rgba<u8>, Vec<u8>>,
+        (i32, i32, i32, i32),
+        (i32, i32),
+        (i32, i32),
+    ),
+    SubRegionSelected(
+        ImageBuffer<Rgba<u8>, Vec<u8>>,
+        (i32, i32, i32, i32),
+        (i32, i32, i32, i32),
+    ),
 }
 
 // 全局热键ID
 const HOTKEY_ID: i32 = 1;
-const SAVE_HOTKEY_ID: i32 = 2; // 新增保存热键ID
+const SAVE_HOTKEY_ID: i32 = 2;
 
 fn main() {
     // 创建通道用于线程间通信
@@ -56,12 +67,7 @@ fn main() {
                 'D' as u32,
             );
             // 注册全局热键: Ctrl+S 用于保存
-            RegisterHotKey(
-                null_mut(),
-                SAVE_HOTKEY_ID,
-                MOD_CONTROL as u32,
-                'S' as u32,
-            );
+            RegisterHotKey(null_mut(), SAVE_HOTKEY_ID, MOD_CONTROL as u32, 'S' as u32);
         }
 
         // Windows 消息循环
@@ -78,18 +84,15 @@ fn main() {
             }
 
             match msg.message {
-                WM_HOTKEY => {
-                    match msg.wParam as i32 {
-                        HOTKEY_ID => {
-                            tx_clone.send(AppEvent::GlobalHotkeyPressed).unwrap();
-                        }
-                        SAVE_HOTKEY_ID => {
-                            // 发送保存事件
-                            tx_clone.send(AppEvent::KeyPressed(Key::S)).unwrap();
-                        }
-                        _ => {}
+                WM_HOTKEY => match msg.wParam as i32 {
+                    HOTKEY_ID => {
+                        tx_clone.send(AppEvent::GlobalHotkeyPressed).unwrap();
                     }
-                }
+                    SAVE_HOTKEY_ID => {
+                        tx_clone.send(AppEvent::KeyPressed(Key::S)).unwrap();
+                    }
+                    _ => {}
+                },
                 WM_QUIT => {
                     tx_clone.send(AppEvent::Quit).unwrap();
                     break;
@@ -115,7 +118,7 @@ fn main() {
     println!("Press Ctrl+Alt+D to capture screen, ESC to exit");
     println!("Press Ctrl+S to save selected region");
 
-    // 创建窗口选项 - 设置为无边框全屏且置顶
+    // 创建窗口选项
     let mut window_options = WindowOptions::default();
     window_options.resize = false;
     window_options.scale = Scale::X1;
@@ -135,19 +138,18 @@ fn main() {
         panic!("{}", e);
     });
 
-    // 无边框代码，确保窗口无边框
+    // 无边框代码
     #[cfg(windows)]
     unsafe {
         use winapi::um::winuser::{GWL_STYLE, SetWindowLongPtrW};
         use winapi::um::winuser::{WS_POPUP, WS_VISIBLE};
 
         let hwnd = window.get_window_handle() as *mut _;
-        // 设置窗口样式为无边框
         SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_POPUP | WS_VISIBLE) as isize);
     }
 
     // 设置帧率限制
-    window.set_target_fps(120);
+    window.set_target_fps(60); // 降低帧率以减少CPU使用
 
     // 初始化状态
     let mut state = State::Idle;
@@ -156,11 +158,14 @@ fn main() {
     // 事件队列
     let mut events = VecDeque::new();
 
-    // 初始时隐藏窗口 - 使用更可靠的方法
+    // 初始时隐藏窗口
     window.set_position(-(screen_width as isize * 2), -(screen_height as isize * 2));
 
     // 按键状态跟踪
     let mut key_states = std::collections::HashMap::new();
+
+    // 缓存图像显示缓冲区，避免频繁分配内存
+    let mut display_buffer: Option<Vec<u32>> = None;
 
     // 主事件循环
     while window.is_open() {
@@ -204,7 +209,6 @@ fn main() {
         // 处理所有事件
         let mut processed_events = Vec::new();
         while let Some(event) = events.pop_front() {
-            // 如果是退出事件，退出程序
             if let AppEvent::Quit = event {
                 break;
             }
@@ -217,17 +221,19 @@ fn main() {
         for (event, new_state) in processed_events {
             if let Some(new_state) = new_state {
                 state = new_state;
+                // 状态改变时重置显示缓冲区
+                display_buffer = None;
             }
         }
 
         // 根据当前状态更新显示
-        update_display(&mut window, &state);
+        update_display(&mut window, &state, &mut display_buffer);
 
         // 更新窗口
         window.update();
 
         // 短暂延迟以减少CPU使用
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(16)); // ~60fps
     }
 
     // 发送退出消息给消息线程
@@ -236,7 +242,7 @@ fn main() {
     }
 }
 
-// 事件处理函数 - 现在返回Option<State>，表示可能的状态变化
+// 事件处理函数
 fn handle_event(
     event: AppEvent,
     state: &State,
@@ -245,40 +251,39 @@ fn handle_event(
 ) -> Option<State> {
     match (event, state) {
         (AppEvent::KeyPressed(Key::Escape), State::Idle) => {
-            // Idle状态下按ESC退出程序
             std::process::exit(0);
         }
         (AppEvent::KeyPressed(Key::Escape), State::FullscreenCapture(img)) => {
-            // 截图后按ESC回到Idle状态
             window.set_position(-(img.width() as isize * 2), -(img.height() as isize * 2));
             window.set_title("Screen Capture - Press Ctrl+Alt+D to capture screen, ESC to exit");
             Some(State::Idle)
         }
         (AppEvent::KeyPressed(Key::Escape), State::SelectingRegion(img, _, _)) => {
-            // 选择区域时按ESC回到FullscreenCapture状态
             window.set_title("Screen captured - Click and drag to select region, ESC to cancel");
             Some(State::FullscreenCapture(img.clone()))
         }
-        (AppEvent::KeyPressed(Key::Escape), State::RegionSelected(img, _)) => {
-            // 区域选择后按ESC回到FullscreenCapture状态
+        (AppEvent::KeyPressed(Key::Escape), State::RegionSelected(img, region)) => {
             window.set_title("Screen captured - Click and drag to select region, ESC to cancel");
             Some(State::FullscreenCapture(img.clone()))
+        }
+        (AppEvent::KeyPressed(Key::Escape), State::SelectingSubRegion(img, red_region, _, _)) => {
+            window.set_title("Region selected - Press Ctrl+S to save, or click and drag to select sub-region, ESC to re-select");
+            Some(State::RegionSelected(img.clone(), *red_region))
+        }
+        (AppEvent::KeyPressed(Key::Escape), State::SubRegionSelected(img, red_region, _)) => {
+            window.set_title("Region selected - Press Ctrl+S to save, or click and drag to select sub-region, ESC to re-select");
+            Some(State::RegionSelected(img.clone(), *red_region))
         }
         (AppEvent::GlobalHotkeyPressed, State::Idle) => {
-            // 全局热键触发截图
-            // 最小化窗口
             window.set_position(
                 -(primary_screen.display_info.width as isize * 2),
                 -(primary_screen.display_info.height as isize * 2),
             );
 
-            // 短暂延迟确保窗口已最小化
             std::thread::sleep(std::time::Duration::from_millis(100));
 
-            // 捕获屏幕
             match capture_screen(primary_screen) {
                 Ok(image_buffer) => {
-                    // 恢复窗口位置到全屏
                     window.set_position(0, 0);
                     window.set_title(
                         "Screen captured - Click and drag to select region, ESC to cancel",
@@ -286,7 +291,6 @@ fn handle_event(
                     Some(State::FullscreenCapture(image_buffer))
                 }
                 Err(e) => {
-                    // 恢复窗口位置
                     window.set_position(0, 0);
                     eprintln!("Failed to capture screen: {}", e);
                     Some(State::Idle)
@@ -294,7 +298,6 @@ fn handle_event(
             }
         }
         (AppEvent::KeyPressed(Key::S), State::RegionSelected(img, region)) => {
-            // 保存选择的区域
             save_image_webp(
                 &img,
                 region.0,
@@ -306,27 +309,37 @@ fn handle_event(
                 None,
             );
 
-            // 保存后隐藏窗口并回到Idle状态
             window.set_position(-(img.width() as isize * 2), -(img.height() as isize * 2));
             window.set_title("Screen Capture - Press Ctrl+Alt+D to capture screen, ESC to exit");
             Some(State::Idle)
         }
-        (AppEvent::MousePressed(MouseButton::Left, x, y), State::FullscreenCapture(img)) => {
-            // 开始选择区域
-            Some(State::SelectingRegion(
-                img.clone(),
-                (x as i32, y as i32),
-                (x as i32, y as i32),
-            ))
+        (AppEvent::KeyPressed(Key::S), State::SubRegionSelected(img, red_region, green_region)) => {
+            save_image_webp(
+                &img,
+                red_region.0,
+                red_region.1,
+                red_region.2 as u32,
+                red_region.3 as u32,
+                primary_screen.display_info.width as u32,
+                primary_screen.display_info.height as u32,
+                Some((
+                    green_region.0,
+                    green_region.1,
+                    green_region.2 as u32,
+                    green_region.3 as u32,
+                )),
+            );
+
+            window.set_position(-(img.width() as isize * 2), -(img.height() as isize * 2));
+            window.set_title("Screen Capture - Press Ctrl+Alt+D to capture screen, ESC to exit");
+            Some(State::Idle)
         }
-        (AppEvent::MouseMoved(x, y), State::SelectingRegion(img, start, _)) => {
-            // 更新选择区域
-            Some(State::SelectingRegion(
-                img.clone(),
-                *start,
-                (x as i32, y as i32),
-            ))
-        }
+        (AppEvent::MousePressed(MouseButton::Left, x, y), State::FullscreenCapture(img)) => Some(
+            State::SelectingRegion(img.clone(), (x as i32, y as i32), (x as i32, y as i32)),
+        ),
+        (AppEvent::MouseMoved(x, y), State::SelectingRegion(img, start, _)) => Some(
+            State::SelectingRegion(img.clone(), *start, (x as i32, y as i32)),
+        ),
         (
             AppEvent::MouseReleased(MouseButton::Left, x, y),
             State::SelectingRegion(img, start, current),
@@ -342,13 +355,73 @@ fn handle_event(
                     height as i32,
                 );
 
-                window.set_title("Region selected - Press Ctrl+S to save, ESC to re-select");
+                window.set_title("Region selected - Press Ctrl+S to save, or click and drag to select sub-region, ESC to re-select");
                 Some(State::RegionSelected(img.clone(), region))
             } else {
-                // 区域太小，继续选择
                 window
                     .set_title("Screen captured - Click and drag to select region, ESC to cancel");
                 Some(State::FullscreenCapture(img.clone()))
+            }
+        }
+        (AppEvent::MousePressed(MouseButton::Left, x, y), State::RegionSelected(img, region)) => {
+            // 检查点击是否在红框内
+            if x as i32 >= region.0
+                && x as i32 <= region.0 + region.2
+                && y as i32 >= region.1
+                && y as i32 <= region.1 + region.3
+            {
+                Some(State::SelectingSubRegion(
+                    img.clone(),
+                    *region,
+                    (x as i32, y as i32),
+                    (x as i32, y as i32),
+                ))
+            } else {
+                None // 点击在红框外，不处理
+            }
+        }
+        (AppEvent::MouseMoved(x, y), State::SelectingSubRegion(img, red_region, start, _)) => {
+            // 限制绿框在红框内
+            let clamped_x = x.clamp(
+                red_region.0 as f32,
+                red_region.0 as f32 + red_region.2 as f32,
+            );
+            let clamped_y = y.clamp(
+                red_region.1 as f32,
+                red_region.1 as f32 + red_region.3 as f32,
+            );
+
+            Some(State::SelectingSubRegion(
+                img.clone(),
+                *red_region,
+                *start,
+                (clamped_x as i32, clamped_y as i32),
+            ))
+        }
+        (
+            AppEvent::MouseReleased(MouseButton::Left, x, y),
+            State::SelectingSubRegion(img, red_region, start, current),
+        ) => {
+            let width = (current.0 - start.0).abs() as u32;
+            let height = (current.1 - start.1).abs() as u32;
+
+            if width > 5 && height > 5 {
+                let green_region = (
+                    start.0.min(current.0),
+                    start.1.min(current.1),
+                    width as i32,
+                    height as i32,
+                );
+
+                window.set_title("Sub-region selected - Press Ctrl+S to save, ESC to re-select");
+                Some(State::SubRegionSelected(
+                    img.clone(),
+                    *red_region,
+                    green_region,
+                ))
+            } else {
+                window.set_title("Region selected - Press Ctrl+S to save, or click and drag to select sub-region, ESC to re-select");
+                Some(State::RegionSelected(img.clone(), *red_region))
             }
         }
         // 默认情况：不改变状态
@@ -357,13 +430,13 @@ fn handle_event(
 }
 
 // 更新显示函数
-fn update_display(window: &mut Window, state: &State) {
+fn update_display(window: &mut Window, state: &State, display_buffer: &mut Option<Vec<u32>>) {
     match state {
         State::Idle => {
             // 空闲状态，无需显示
         }
         State::FullscreenCapture(image) => {
-            display_image(window, image, None);
+            display_image(window, image, None, None, display_buffer);
         }
         State::SelectingRegion(image, start, current) => {
             let region = Some((
@@ -372,10 +445,34 @@ fn update_display(window: &mut Window, state: &State) {
                 (current.0 - start.0).abs(),
                 (current.1 - start.1).abs(),
             ));
-            display_image(window, image, region);
+            display_image(window, image, region, None, display_buffer);
         }
         State::RegionSelected(image, region) => {
-            display_image(window, image, Some(*region));
+            display_image(window, image, Some(*region), None, display_buffer);
+        }
+        State::SelectingSubRegion(image, red_region, start, current) => {
+            let green_region = Some((
+                start.0.min(current.0),
+                start.1.min(current.1),
+                (current.0 - start.0).abs(),
+                (current.1 - start.1).abs(),
+            ));
+            display_image(
+                window,
+                image,
+                Some(*red_region),
+                green_region,
+                display_buffer,
+            );
+        }
+        State::SubRegionSelected(image, red_region, green_region) => {
+            display_image(
+                window,
+                image,
+                Some(*red_region),
+                Some(*green_region),
+                display_buffer,
+            );
         }
     }
 }
@@ -392,78 +489,114 @@ fn capture_screen(
     Ok(ImageBuffer::from_vec(width, height, buffer).unwrap())
 }
 
-// 显示图像函数
+// 显示图像函数 - 优化版本
 fn display_image(
     window: &mut Window,
     image: &ImageBuffer<Rgba<u8>, Vec<u8>>,
-    region: Option<(i32, i32, i32, i32)>,
+    red_region: Option<(i32, i32, i32, i32)>,
+    green_region: Option<(i32, i32, i32, i32)>,
+    display_buffer: &mut Option<Vec<u32>>,
 ) {
     let (width, height) = image.dimensions();
-    let mut buffer = vec![0; (width * height) as usize];
 
-    // 将图像数据复制到缓冲区
-    for (i, pixel) in image.pixels().enumerate() {
-        let r = pixel[0] as u32;
-        let g = pixel[1] as u32;
-        let b = pixel[2] as u32;
-        let a = pixel[3] as u32;
+    // 重用缓冲区或创建新缓冲区
+    let buffer = display_buffer.get_or_insert_with(|| vec![0; (width * height) as usize]);
 
-        buffer[i] = (a << 24) | (r << 16) | (g << 8) | b;
-    }
-
-    // 如果有选择区域，变灰区域外的部分
-    if let Some((x, y, w, h)) = region {
-        for i in 0..(width as usize) {
-            for j in 0..(height as usize) {
-                let idx = j * width as usize + i;
-                if i < x as usize
-                    || i >= (x + w) as usize
-                    || j < y as usize
-                    || j >= (y + h) as usize
-                {
-                    // 区域外变灰
-                    let pixel = buffer[idx];
-                    let r = ((pixel >> 16) & 0xFF) as f32;
-                    let g = ((pixel >> 8) & 0xFF) as f32;
-                    let b = (pixel & 0xFF) as f32;
-                    let gray = (r * 0.3 + g * 0.59 + b * 0.11) as u32;
-                    buffer[idx] = (0x80 << 24) | (gray << 16) | (gray << 8) | gray;
-                }
-            }
+    // 如果有选择区域，先绘制变灰的背景
+    if red_region.is_some() {
+        // 快速填充灰色背景
+        for pixel in buffer.iter_mut() {
+            *pixel = 0x80808080; // ARGB: 半透明灰色
         }
 
-        // 绘制选择框
-        let x1 = x as usize;
-        let y1 = y as usize;
-        let x2 = (x + w) as usize;
-        let y2 = (y + h) as usize;
+        // 复制红框内的原始图像
+        if let Some((rx, ry, rw, rh)) = red_region {
+            for y in ry..(ry + rh) {
+                if y < 0 || y >= height as i32 {
+                    continue;
+                }
+                for x in rx..(rx + rw) {
+                    if x < 0 || x >= width as i32 {
+                        continue;
+                    }
 
-        for i in x1..=x2 {
-            if i < width as usize {
-                if y1 < height as usize {
-                    buffer[y1 * width as usize + i] = 0xFFFF0000; // 红色边框
+                    let idx = (y as usize) * width as usize + (x as usize);
+                    let pixel = image.get_pixel(x as u32, y as u32);
+                    let r = pixel[0] as u32;
+                    let g = pixel[1] as u32;
+                    let b = pixel[2] as u32;
+                    let a = pixel[3] as u32;
+
+                    buffer[idx] = (a << 24) | (r << 16) | (g << 8) | b;
                 }
-                if y2 < height as usize {
-                    buffer[y2 * width as usize + i] = 0xFFFF0000;
-                }
+            }
+
+            // 绘制红框
+            draw_rectangle(
+                buffer,
+                width as usize,
+                height as usize,
+                (rx, ry, rw, rh),
+                0xFFFF0000,
+            );
+
+            // 如果有绿框，绘制绿框
+            if let Some((gx, gy, gw, gh)) = green_region {
+                draw_rectangle(
+                    buffer,
+                    width as usize,
+                    height as usize,
+                    (gx, gy, gw, gh),
+                    0xFF00FF00,
+                );
             }
         }
+    } else {
+        // 没有选择区域，直接显示完整图像
+        for (i, pixel) in image.pixels().enumerate() {
+            let r = pixel[0] as u32;
+            let g = pixel[1] as u32;
+            let b = pixel[2] as u32;
+            let a = pixel[3] as u32;
 
-        for j in y1..=y2 {
-            if j < height as usize {
-                if x1 < width as usize {
-                    buffer[j * width as usize + x1] = 0xFFFF0000;
-                }
-                if x2 < width as usize {
-                    buffer[j * width as usize + x2] = 0xFFFF0000;
-                }
-            }
+            buffer[i] = (a << 24) | (r << 16) | (g << 8) | b;
         }
     }
 
     window
-        .update_with_buffer(&buffer, width as usize, height as usize)
+        .update_with_buffer(buffer, width as usize, height as usize)
         .unwrap();
+}
+
+// 绘制矩形边框的辅助函数
+fn draw_rectangle(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    rect: (i32, i32, i32, i32),
+    color: u32,
+) {
+    let (x, y, w, h) = rect;
+
+    // 绘制上边框
+    for i in x..(x + w) {
+        if i >= 0 && i < width as i32 && y >= 0 && y < height as i32 {
+            buffer[y as usize * width + i as usize] = color;
+        }
+        if i >= 0 && i < width as i32 && (y + h - 1) >= 0 && (y + h - 1) < height as i32 {
+            buffer[(y + h - 1) as usize * width + i as usize] = color;
+        }
+    }
+
+    // 绘制左边框
+    for j in y..(y + h) {
+        if j >= 0 && j < height as i32 && x >= 0 && x < width as i32 {
+            buffer[j as usize * width + x as usize] = color;
+        }
+        if j >= 0 && j < height as i32 && (x + w - 1) >= 0 && (x + w - 1) < width as i32 {
+            buffer[j as usize * width + (x + w - 1) as usize] = color;
+        }
+    }
 }
 
 // 保存为WebP格式的函数（无损）
@@ -492,65 +625,28 @@ fn save_image_webp(
         dir_name, timestamp, x, y, width, height
     );
 
-    if let Some((sx, sy, sw, sh)) = sub_region {
-        file_name.push_str(&format!("_Sx{}Sy{}Sw{}Sh{}", sx, sy, sw, sh));
-    }
+    //// 添加子框信息，暂不使用
+    // if let Some((sx, sy, sw, sh)) = sub_region {
+    //     file_name.push_str(&format!("_Sx{}Sy{}Sw{}Sh{}", sx, sy, sw, sh));
+    // }
 
     file_name.push_str(".webp");
 
     // 裁剪图像
-    let cropped = image::imageops::crop_imm(image, x as u32, y as u32, width, height).to_image();
+    let cropped = if let Some((sx, sy, sw, sh)) = sub_region {
+        // 保存绿框内的图像
+        image::imageops::crop_imm(image, sx as u32, sy as u32, sw, sh).to_image()
+    } else {
+        // 保存红框内的图像
+        image::imageops::crop_imm(image, x as u32, y as u32, width, height).to_image()
+    };
 
     // 转换为WebP格式（无损）
-    let encoder = Encoder::from_rgba(cropped.as_raw(), width, height);
+    let encoder = Encoder::from_rgba(cropped.as_raw(), cropped.width(), cropped.height());
     let webp_data: WebPMemory = encoder.encode_lossless();
 
     // 保存图像
     if let Err(e) = std::fs::write(&file_name, webp_data.as_ref()) {
-        eprintln!("Failed to save image: {}", e);
-    } else {
-        println!("Image saved as: {}", file_name);
-    }
-}
-
-// 保留原有的BMP保存函数，但不再使用
-#[allow(dead_code)]
-fn save_image_bmp(
-    image: &ImageBuffer<Rgba<u8>, Vec<u8>>,
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
-    screen_width: u32,
-    screen_height: u32,
-    sub_region: Option<(i32, i32, u32, u32)>,
-) {
-    // 创建目录
-    let dir_name = format!("W{}H{}", screen_width, screen_height);
-    let _ = std::fs::create_dir_all(&dir_name);
-
-    // 生成文件名
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-
-    let mut file_name = format!(
-        "{}/screenshot_{}_Lx{}Ty{}W{}H{}",
-        dir_name, timestamp, x, y, width, height
-    );
-
-    if let Some((sx, sy, sw, sh)) = sub_region {
-        file_name.push_str(&format!("_Sx{}Sy{}Sw{}Sh{}", sx, sy, sw, sh));
-    }
-
-    file_name.push_str(".bmp");
-
-    // 裁剪图像
-    let cropped = image::imageops::crop_imm(image, x as u32, y as u32, width, height).to_image();
-
-    // 保存图像
-    if let Err(e) = cropped.save(&file_name) {
         eprintln!("Failed to save image: {}", e);
     } else {
         println!("Image saved as: {}", file_name);
